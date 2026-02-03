@@ -64,6 +64,14 @@ class WebcamClassifier:
         self.is_high_confidence = False  # Whether accuracy exceeds 80%
         self.current_prediction = None  # Current prediction result
         self.last_displayed_label = None  # Last displayed label, to avoid reloading
+        self.low_confidence_count = 0  # Debounce: only clear reference image after N consecutive low-confidence updates
+        
+        # GIF tick (same pattern as test_gif_standalone.py)
+        self._gif_after_id = None
+        self._gif_index = [0]
+        self._gif_photo_frames = None
+        self._gif_delays = None
+        self._gif_ref_label = None
         
         # Image display manager
         if ImageDisplay:
@@ -144,24 +152,18 @@ class WebcamClassifier:
         self.image_label = tk.Label(camera_frame, text="Waiting to start camera...", bg="black", fg="white")
         self.image_label.pack(expand=True, fill=tk.BOTH)
         
-        # Image display area
-        result_image_frame = ttk.LabelFrame(camera_image_frame, text="Reference Image", padding="5")
-        result_image_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Reference image opens in separate window; placeholder here
+        ttk.Label(camera_image_frame, text="Reference image opens in separate window\nwhen accuracy >= 80%", 
+                 font=("", 10)).grid(row=0, column=1, padx=20, pady=20)
         
-        # Create fixed-size container Frame
-        image_container = tk.Frame(result_image_frame, width=270, height=270, bg="lightgray")
-        image_container.pack(expand=False)
-        image_container.pack_propagate(False)  # Prevent child widgets from changing container size
-        
-        # Use fixed-size Label to ensure consistent image display area size
-        self.result_image_label = tk.Label(image_container, text="Waiting for detection...", bg="lightgray", 
-                                           anchor="center")
-        self.result_image_label.pack(expand=True, fill=tk.BOTH)
-        self.result_image_photo = None  # Keep image reference
+        # Reference image window (Toplevel) - created on first use
+        self.reference_window = None
+        self.reference_image_label = None
+        self.reference_image_photo = None
         
         # Configure column weights
-        camera_image_frame.columnconfigure(0, weight=2)  # Camera area takes more space
-        camera_image_frame.columnconfigure(1, weight=1)   # Image area
+        camera_image_frame.columnconfigure(0, weight=1)
+        camera_image_frame.columnconfigure(1, weight=0)
         camera_image_frame.rowconfigure(0, weight=1)
         
         # Classification results display
@@ -222,6 +224,64 @@ class WebcamClassifier:
         else:
             self.status_var.set("Camera list refreshed")
     
+    def _get_reference_window(self):
+        """Create reference image Toplevel on first use; return (window, label)."""
+        if self.reference_window is not None and self.reference_window.winfo_exists():
+            return self.reference_window, self.reference_image_label
+        self.reference_window = tk.Toplevel(self.root)
+        self.reference_window.title("Reference Image")
+        self.reference_window.geometry("320x320")
+        self.reference_window.resizable(True, True)
+        self.reference_window.protocol("WM_DELETE_WINDOW", self._hide_reference_window)
+        frame = tk.Frame(self.reference_window, padx=10, pady=10, bg="white")
+        frame.pack(expand=True, fill=tk.BOTH)
+        self.reference_image_label = tk.Label(frame, text="Waiting for detection...", bg="lightgray", anchor="center")
+        self.reference_image_label.pack(expand=True, fill=tk.BOTH)
+        self.reference_image_photo = None
+        self.reference_window.withdraw()  # Hide until we have an image to show
+        return self.reference_window, self.reference_image_label
+
+    def _stop_gif_tick(self):
+        """Stop GIF tick loop (same pattern as test_gif_standalone.py)."""
+        if self._gif_after_id is not None:
+            try:
+                self.root.after_cancel(self._gif_after_id)
+            except Exception:
+                pass
+            self._gif_after_id = None
+        self._gif_ref_label = None
+
+    def _start_gif_tick(self, photo_frames, delays, ref_label):
+        """Start GIF tick loop like test_gif_standalone.py."""
+        self._stop_gif_tick()
+        if not photo_frames or not ref_label:
+            return
+        self._gif_photo_frames = photo_frames
+        self._gif_delays = delays
+        self._gif_ref_label = ref_label
+        self._gif_index[0] = 0
+
+        def tick():
+            if self._gif_ref_label is None or not self._gif_ref_label.winfo_exists():
+                self._gif_after_id = None
+                return
+            photo_frames = self._gif_photo_frames
+            delays = self._gif_delays or [100] * len(photo_frames)
+            i = self._gif_index[0] % len(photo_frames)
+            self._gif_ref_label.configure(image=photo_frames[i])
+            self._gif_ref_label.image = photo_frames[i]
+            self._gif_index[0] += 1
+            delay = delays[i] if i < len(delays) else 100
+            self._gif_after_id = self.root.after(delay, tick)
+
+        self._gif_after_id = self.root.after(100, tick)
+
+    def _hide_reference_window(self):
+        """Hide reference window (user closed it); stop animations."""
+        self._stop_gif_tick()
+        if self.reference_window is not None and self.reference_window.winfo_exists():
+            self.reference_window.withdraw()
+
     def on_closing(self):
         """Handle window closing"""
         if self.is_running:
@@ -230,6 +290,8 @@ class WebcamClassifier:
         
         # Confirm if really want to close
         if tk.messagebox.askokcancel("Exit", "Are you sure you want to exit the application?"):
+            if self.reference_window is not None and self.reference_window.winfo_exists():
+                self.reference_window.destroy()
             self.root.destroy()
     
     def detect_available_cameras(self):
@@ -544,9 +606,6 @@ class WebcamClassifier:
             # Update reference image display
             self.update_reference_image()
             
-            # Update reference image display
-            self.update_reference_image()
-            
             # Update status bar
             status_text = f"Capturing - Last Update: {timestamp}"
             if self.is_high_confidence:
@@ -559,44 +618,43 @@ class WebcamClassifier:
             traceback.print_exc()
     
     def update_reference_image(self):
-        """Update reference image display based on classification results"""
+        """Update reference image display in separate window based on classification results"""
         try:
             if not self.image_display:
                 return
             
-            # If accuracy exceeds 80%, display corresponding class image
+            # If accuracy exceeds 80%, display corresponding class image in reference window
             if self.is_high_confidence and self.current_prediction:
-                class_label = self.current_prediction[0]  # Get class label
+                self.low_confidence_count = 0
+                class_label = self.current_prediction[0]
                 
-                # Only reload image when label changes (avoid frequent reloading causing animation reset)
                 if class_label != self.last_displayed_label:
-                    # Load and display image (resize to fit right panel, about 1/3 of camera feed size)
-                    photo = self.image_display.load_image(class_label, max_width=250, max_height=250)
+                    self._stop_gif_tick()
+                    photo = self.image_display.load_image(class_label, max_width=320, max_height=320)
                     if photo:
-                        self.result_image_label.configure(image=photo, text="")
-                        self.result_image_photo = photo  # Keep reference
-                        print(f"Displaying reference image for {class_label}")
-                        
-                        # Check if it's an animated GIF, if so start animation
+                        win, ref_label = self._get_reference_window()
+                        win.deiconify()
+                        ref_label.configure(image=photo, text="")
+                        self.reference_image_photo = photo
                         if class_label in self.image_display.gif_frames:
-                            self.image_display.start_animation(class_label, self.result_image_label, self.root)
-                        
+                            photo_frames = self.image_display.gif_frames[class_label]
+                            delays = self.image_display.gif_delays.get(class_label, [100] * len(photo_frames))
+                            self._start_gif_tick(photo_frames, delays, ref_label)
                         self.last_displayed_label = class_label
                     else:
-                        self.result_image_label.configure(image="", text=f"Image load failed\n{class_label}")
-                        self.result_image_photo = None
+                        win, ref_label = self._get_reference_window()
+                        ref_label.configure(image="", text=f"Image load failed\n{class_label}")
+                        self.reference_image_photo = None
                         self.last_displayed_label = None
-                # If label is the same, no need to reload, animation should continue running
             else:
-                # Accuracy not sufficient, clear image display
-                if self.last_displayed_label is not None:  # Only clear if image was displayed before
-                    self.result_image_label.configure(image="", text="Waiting for detection...\n(Accuracy ≥80% required)")
-                    self.result_image_photo = None
-                    # Stop all animations
-                    if self.image_display:
-                        for label in list(self.image_display.animation_labels.keys()):
-                            self.image_display.stop_animation(label, self.root)
-                    self.last_displayed_label = None
+                if self.last_displayed_label is not None:
+                    self.low_confidence_count += 1
+                    if self.low_confidence_count >= 5:
+                        self._stop_gif_tick()
+                        self.last_displayed_label = None
+                        if self.reference_window is not None and self.reference_window.winfo_exists():
+                            self.reference_window.withdraw()
+                        self.reference_image_photo = None
                 
         except Exception as e:
             print(f"Update reference image error: {e}")
@@ -606,21 +664,13 @@ class WebcamClassifier:
     def clear_image_display(self):
         """Clear image display area"""
         try:
-            # Clear camera image display
             self.image_label.configure(image="", text="Waiting to start camera...")
             self.image_label.image = None
             
-            # Clear reference image display
-            if hasattr(self, 'result_image_label'):
-                self.result_image_label.configure(image="", text="Waiting for detection...")
-                self.result_image_photo = None
+            self._hide_reference_window()
+            self.reference_image_photo = None
+            self.last_displayed_label = None
             
-            # Stop all GIF animations
-            if self.image_display:
-                for label in list(self.image_display.animation_labels.keys()):
-                    self.image_display.stop_animation(label, self.root)
-            
-            # Clear classification results
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, "Waiting to start camera...")
             

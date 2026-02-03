@@ -209,16 +209,14 @@ class ImageDisplay:
                     frames.append(final_image)
                     
                     # Get current frame delay time
-                    # PIL's duration unit is seconds, need to convert to milliseconds
+                    # Pillow returns GIF duration in milliseconds (not seconds)
                     delay = default_delay
                     try:
-                        # Try to get delay time from current frame's info
                         frame_info = pil_image.info if hasattr(pil_image, 'info') else {}
                         if 'duration' in frame_info:
-                            delay_seconds = frame_info['duration']
-                            # Convert to milliseconds, use default if 0 or invalid
-                            if delay_seconds and delay_seconds > 0:
-                                delay = int(delay_seconds * 1000)  # seconds to milliseconds
+                            d = frame_info['duration']
+                            if d and d > 0:
+                                delay = int(d)  # already in milliseconds
                             else:
                                 delay = default_delay
                         else:
@@ -232,9 +230,6 @@ class ImageDisplay:
                         delay = 100  # If delay too long, use default
                     delay = max(50, min(2000, int(delay)))
                     delays.append(delay)
-                    if frame_count < 5:  # Only print debug info for first 5 frames
-                        print(f"Debug: Frame {frame_count} delay time: {delay} ms")
-                    
                     frame_count += 1
                     
                     # Try to read next frame
@@ -288,28 +283,18 @@ class ImageDisplay:
                     is_animated = False
                     pil_image.seek(0)
                 
-                # If animated GIF, load all frames
+                # If animated GIF, load all frames and convert to PhotoImage once (keep refs to avoid GC)
                 if is_animated:
-                    print(f"Debug: Detected animated GIF: {class_label}")
-                    frames, delays = self._load_gif_frames(image_path, max_width, max_height)
-                    print(f"Debug: Loaded {len(frames)} frames, delay times: {delays[:5]}...")
-                    if frames:
-                        self.gif_frames[class_label] = frames
+                    frames_pil, delays = self._load_gif_frames(image_path, max_width, max_height)
+                    if frames_pil:
+                        # Pre-create PhotoImage for every frame so refs stay alive; required for Tkinter
+                        photo_frames = [ImageTk.PhotoImage(img) for img in frames_pil]
+                        self.gif_frames[class_label] = photo_frames
                         self.gif_delays[class_label] = delays
-                        print(f"Loaded animated GIF: {class_label}, total {len(frames)} frames")
-                        # Return first frame as initial display (already processed RGB image)
-                        pil_image = frames[0]
-                        # Directly convert to PhotoImage and return, skip subsequent processing
-                        photo = ImageTk.PhotoImage(pil_image)
-                        return photo
+                        return photo_frames[0]
                     else:
-                        print(f"Debug: GIF frame loading failed: {class_label}")
-                        # If loading fails, use first frame
                         pil_image.seek(0)
                         is_animated = False
-                else:
-                    print(f"Debug: Single-frame GIF: {class_label}")
-                    # Single-frame GIF, normal processing
                     pil_image.seek(0)
                 
                 # GIF is usually palette mode (P) or RGBA mode
@@ -429,26 +414,15 @@ class ImageDisplay:
             label_widget: Label widget for displaying animation
             root: Tkinter root window object (for after method)
         """
-        # If this GIF has no animation frames, don't start animation
         if class_label not in self.gif_frames or not self.gif_frames[class_label]:
-            print(f"Debug: {class_label} has no animation frames, not starting animation")
-            print(f"Debug: gif_frames keys = {list(self.gif_frames.keys())}")
             return
         
-        # Check if animation is already running (same class_label and same Label)
         if (class_label in self.animation_jobs and 
             class_label in self.animation_labels and 
             self.animation_labels[class_label] == label_widget):
-            # Animation already running, no need to restart
-            print(f"Debug: Animation for {class_label} is already running, skipping restart")
             return
         
-        print(f"Debug: Starting GIF animation for {class_label}, total {len(self.gif_frames[class_label])} frames")
-        
-        # Stop previous animation (if exists)
         self.stop_animation(class_label, root)
-        
-        # Store Label reference and root window
         self.animation_labels[class_label] = label_widget
         self.animation_indices[class_label] = 0
         
@@ -487,7 +461,6 @@ class ImageDisplay:
             root: Tkinter root window object
         """
         if class_label not in self.gif_frames or class_label not in self.animation_labels:
-            print(f"Debug: Animation stopped - {class_label} not in gif_frames or animation_labels")
             return
         
         frames = self.gif_frames[class_label]
@@ -498,46 +471,30 @@ class ImageDisplay:
         if not frames or current_index >= len(frames):
             current_index = 0
         
-        # Get current frame and convert to PhotoImage
+        # Use pre-created PhotoImage (frames are already PhotoImage, no new conversion)
         try:
-            frame_image = frames[current_index]
-            photo = ImageTk.PhotoImage(frame_image)
-            
-            # Update Label display
+            photo = frames[current_index]
             label_widget.configure(image=photo)
-            label_widget.image = photo  # Keep reference
+            label_widget.image = photo
+            try:
+                label_widget.update_idletasks()
+            except Exception:
+                pass
             
-            # Get current frame delay time (before updating index)
             delay = delays[current_index] if current_index < len(delays) else 100
-            
-            # Debug info (only first few times)
-            if current_index < 3:
-                print(f"Debug: Displaying frame {current_index}/{len(frames)}, delay {delay}ms")
-            
-            # Update index to next frame
             next_index = (current_index + 1) % len(frames)
             self.animation_indices[class_label] = next_index
             
-            # Schedule next update (use wrapper function to avoid lambda closure issues)
-            # Use copy of next_index to avoid closure issues
-            next_index_copy = next_index
             def animate_callback():
-                # Add debug info to confirm callback is called
-                print(f"Debug: Callback executed - {class_label} next frame index {next_index_copy}")
                 try:
                     self._animate_gif(class_label, root)
                 except Exception as e:
-                    print(f"Debug: Callback execution error: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"GIF animation error ({class_label}): {e}")
             
-            # Set function name for tkinter recognition
             animate_callback.__name__ = f'_animate_gif_{class_label}'
             after_id = root.after(delay, animate_callback)
             self.animation_jobs[class_label] = after_id
-            
-            if next_index <= 3:  # Print debug info for first few frames
-                print(f"Debug: Scheduled next frame {next_index}, delay {delay}ms, after_id = {after_id}")
+            self._last_animate_callback = animate_callback  # Keep ref so callback is not GC'd
             
         except Exception as e:
             print(f"Animated GIF update failed ({class_label}): {e}")
